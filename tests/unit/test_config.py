@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 
 @pytest.fixture
-def restore_reasoning_effort_config(monkeypatch):
+def restore_config_module(monkeypatch):
     """Restore config after tests that reload it with patched environment values."""
     yield
 
@@ -139,7 +139,7 @@ class TestLogLevelConfig:
             assert config_module.LOG_LEVEL == "CRITICAL"
 
 
-@pytest.mark.usefixtures("restore_reasoning_effort_config")
+@pytest.mark.usefixtures("restore_config_module")
 class TestDefaultReasoningEffortConfig:
     """Tests for KIRO_DEFAULT_REASONING_EFFORT configuration."""
 
@@ -191,6 +191,39 @@ class TestDefaultReasoningEffortConfig:
 
         assert config_module.KIRO_DEFAULT_REASONING_EFFORT == expected_effort
 
+
+@pytest.mark.usefixtures("restore_config_module")
+class TestFirstTokenTimeoutConfig:
+    """Tests for FIRST_TOKEN_TIMEOUT configuration."""
+
+    def test_defaults_to_60_seconds(self):
+        """Missing configuration uses a 60-second first-token timeout."""
+        original_getenv = os.getenv
+
+        def getenv_without_first_token_timeout(key, default=None):
+            if key == "FIRST_TOKEN_TIMEOUT":
+                return default
+
+            return original_getenv(key, default)
+
+        with patch.object(os, "getenv", side_effect=getenv_without_first_token_timeout):
+            from importlib import reload
+            import kiro.config as config_module
+
+            reload(config_module)
+
+        assert config_module.FIRST_TOKEN_TIMEOUT == 60.0
+
+    def test_environment_overrides_default(self, monkeypatch):
+        """Explicit environment configuration overrides the timeout default."""
+        monkeypatch.setenv("FIRST_TOKEN_TIMEOUT", "90")
+
+        from importlib import reload
+        import kiro.config as config_module
+
+        reload(config_module)
+
+        assert config_module.FIRST_TOKEN_TIMEOUT == 90.0
 
 class TestToolDescriptionMaxLengthConfig:
     """Tests for TOOL_DESCRIPTION_MAX_LENGTH configuration."""
@@ -346,6 +379,8 @@ class TestTimeoutConfigurationWarning:
             
             # Warning should contain recommendation
             assert "Recommendation" in captured.err or "LESS than" in captured.err
+            assert "default: 60s" in captured.err
+            assert "FIRST_TOKEN_TIMEOUT=60" in captured.err
 
 
 class TestAwsSsoOidcUrlConfig:

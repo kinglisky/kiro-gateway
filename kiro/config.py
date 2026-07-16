@@ -354,9 +354,9 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 # Timeout for waiting for the first token from the model (in seconds).
 # If the model doesn't respond within this time, the request will be cancelled and retried.
 # This helps handle "stuck" requests when the model takes too long to think.
-# Default: 30 seconds (recommended for production)
+# Default: 60 seconds (recommended for production)
 # Set a lower value (e.g., 10-15) for more aggressive retry.
-FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "15"))
+FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "60"))
 
 # Read timeout for streaming responses (in seconds).
 # This is the maximum time to wait for data between chunks during streaming.
@@ -409,13 +409,13 @@ def _warn_timeout_configuration():
     FIRST_TOKEN_TIMEOUT ({FIRST_TOKEN_TIMEOUT}s) >= STREAMING_READ_TIMEOUT ({STREAMING_READ_TIMEOUT}s)
     
     These timeouts serve different purposes:
-      - FIRST_TOKEN_TIMEOUT: time to wait for model to START responding (default: 15s)
+      - FIRST_TOKEN_TIMEOUT: time to wait for model to START responding (default: 60s)
       - STREAMING_READ_TIMEOUT: time to wait BETWEEN chunks during streaming (default: 300s)
     
     Recommendation: FIRST_TOKEN_TIMEOUT should be LESS than STREAMING_READ_TIMEOUT.
     
     Example configuration:
-      FIRST_TOKEN_TIMEOUT=15
+      FIRST_TOKEN_TIMEOUT=60
       STREAMING_READ_TIMEOUT=300{RESET}
 """
         print(warning_text, file=sys.stderr)

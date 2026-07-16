@@ -83,6 +83,17 @@ class ThinkingConfig:
     effort: Optional[ReasoningEffort] = None
 
 
+@dataclass(frozen=True)
+class ReasoningMetadata:
+    """Safe summary of the reasoning controls sent to Kiro."""
+
+    model_id: str
+    thinking: str
+    effort: str
+    control: str
+    budget_tokens: str
+
+
 @dataclass
 class UnifiedMessage:
     """
@@ -310,6 +321,13 @@ GPT_5_6_REASONING_MODEL_IDS = frozenset({
     "gpt-5.6-luna",
 })
 
+REASONING_CONTROL_BY_CHANNELS = {
+    (False, False): "none",
+    (True, False): "native",
+    (False, True): "xml",
+    (True, True): "native+xml",
+}
+
 
 def is_claude_model(model_id: str) -> bool:
     """Return whether a resolved Kiro model ID belongs to Claude."""
@@ -328,6 +346,43 @@ def supports_native_reasoning(model_id: str) -> bool:
 def uses_legacy_thinking_tags(model_id: str) -> bool:
     """Return whether the model should retain legacy XML thinking controls."""
     return model_id not in GPT_5_6_REASONING_MODEL_IDS
+
+
+def resolve_legacy_thinking_budget(
+    thinking_config: ThinkingConfig,
+) -> Optional[int]:
+    """Return the budget that will be written to legacy thinking XML."""
+    if not FAKE_REASONING_ENABLED or not thinking_config.enabled:
+        return None
+
+    requested_budget = (
+        thinking_config.budget_tokens
+        if thinking_config.budget_tokens is not None
+        else FAKE_REASONING_MAX_TOKENS
+    )
+    if FAKE_REASONING_BUDGET_CAP <= 0:
+        return requested_budget
+
+    return min(requested_budget, FAKE_REASONING_BUDGET_CAP)
+
+
+def build_reasoning_metadata(
+    model_id: str,
+    native_effort: Optional[ReasoningEffort],
+    legacy_budget: Optional[int],
+) -> ReasoningMetadata:
+    """Build immutable metadata from the controls actually sent to Kiro."""
+    native_enabled = native_effort is not None
+    xml_enabled = legacy_budget is not None
+    reasoning_enabled = xml_enabled or native_effort not in (None, "none")
+
+    return ReasoningMetadata(
+        model_id=model_id,
+        thinking="enabled" if reasoning_enabled else "disabled",
+        effort=native_effort or "not_set",
+        control=REASONING_CONTROL_BY_CHANNELS[(native_enabled, xml_enabled)],
+        budget_tokens=str(legacy_budget) if xml_enabled else "not_set",
+    )
 
 
 def get_thinking_system_prompt_addition() -> str:
@@ -413,29 +468,25 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
         >>> inject_thinking_tags("Hello", ThinkingConfig(enabled=True, budget_tokens=8000))
         '<thinking_mode>enabled</thinking_mode>\\n<max_thinking_length>8000</max_thinking_length>...Hello'
     """
-    # Check if thinking is enabled globally
-    if not FAKE_REASONING_ENABLED:
+    effective_budget = resolve_legacy_thinking_budget(thinking_config)
+    if effective_budget is None:
+        if not thinking_config.enabled:
+            logger.debug("Thinking disabled by client request")
         return content
-    
-    # Check if thinking is enabled for this request
-    if not thinking_config.enabled:
-        logger.debug("Thinking disabled by client request")
-        return content
-    
-    # Determine effective budget
-    if thinking_config.budget_tokens is not None:
-        effective_budget = thinking_config.budget_tokens
-    else:
-        effective_budget = FAKE_REASONING_MAX_TOKENS
-    
-    # Apply cap if enabled
-    if FAKE_REASONING_BUDGET_CAP > 0 and effective_budget > FAKE_REASONING_BUDGET_CAP:
+
+    requested_budget = (
+        thinking_config.budget_tokens
+        if thinking_config.budget_tokens is not None
+        else FAKE_REASONING_MAX_TOKENS
+    )
+    if effective_budget < requested_budget:
         logger.warning(
-            f"Client requested thinking budget {effective_budget} exceeds cap {FAKE_REASONING_BUDGET_CAP}. "
-            f"Using capped value {FAKE_REASONING_BUDGET_CAP}. "
-            f"Set FAKE_REASONING_BUDGET_CAP=0 to disable capping."
+            "Client requested thinking budget {} exceeds cap {}. "
+            "Using capped value {}. Set FAKE_REASONING_BUDGET_CAP=0 to disable capping.",
+            requested_budget,
+            FAKE_REASONING_BUDGET_CAP,
+            effective_budget,
         )
-        effective_budget = FAKE_REASONING_BUDGET_CAP
     
     # Thinking instruction to improve reasoning quality
     thinking_instruction = (
@@ -456,7 +507,7 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
         f"<thinking_instruction>{thinking_instruction}</thinking_instruction>\n\n"
     )
     
-    logger.debug(f"Injecting thinking tags with budget={effective_budget}")
+    logger.debug("Injecting thinking tags with budget={}", effective_budget)
     
     return thinking_prefix + content
 
@@ -1578,7 +1629,9 @@ def build_kiro_payload(
             user_input_context["toolResults"] = tool_results
     
     # Inject legacy thinking tags only for models that still use them.
+    legacy_budget = None
     if current_message.role == "user" and legacy_thinking_enabled:
+        legacy_budget = resolve_legacy_thinking_budget(thinking_config)
         current_content = inject_thinking_tags(current_content, thinking_config)
     
     # Build userInputMessage
@@ -1616,10 +1669,29 @@ def build_kiro_payload(
         payload["profileArn"] = profile_arn
 
     # Native reasoning fields are supported by Claude and the three GPT 5.6 models.
-    if thinking_config.effort and supports_native_reasoning(model_id):
+    native_effort = (
+        thinking_config.effort
+        if supports_native_reasoning(model_id)
+        else None
+    )
+    if native_effort:
         payload["additionalModelRequestFields"] = {
-            "reasoning": {"effort": thinking_config.effort}
+            "reasoning": {"effort": native_effort}
         }
+
+    reasoning_metadata = build_reasoning_metadata(
+        model_id,
+        native_effort,
+        legacy_budget,
+    )
+    logger.info(
+        "Reasoning request: model_id={} thinking={} effort={} control={} budget_tokens={}",
+        reasoning_metadata.model_id,
+        reasoning_metadata.thinking,
+        reasoning_metadata.effort,
+        reasoning_metadata.control,
+        reasoning_metadata.budget_tokens,
+    )
 
     # Payload size guard — auto-trim if enabled
     if AUTO_TRIM_PAYLOAD:

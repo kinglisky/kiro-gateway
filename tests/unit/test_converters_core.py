@@ -12,7 +12,10 @@ Tests for shared conversion logic used by both OpenAI and Anthropic adapters:
 """
 
 import os
+from io import StringIO
+
 import pytest
+from loguru import logger
 from unittest.mock import patch
 
 from kiro.converters_core import (
@@ -6358,7 +6361,7 @@ class TestInjectThinkingTagsWithConfig:
         What it does: Verifies that budget > cap is capped and WARNING is logged
         Purpose: Ensure cap prevents excessive thinking budget
         """
-        from unittest.mock import patch, call
+        from unittest.mock import patch
         
         print("Setting FAKE_REASONING_ENABLED=True, cap=10000...")
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
@@ -6379,11 +6382,10 @@ class TestInjectThinkingTagsWithConfig:
             assert mock_warning.called, "logger.warning should be called when budget exceeds cap"
             
             # Verify warning message content
-            warning_call = mock_warning.call_args[0][0]
-            print(f"Warning message: {warning_call}")
-            assert "exceeds cap" in warning_call
-            assert "50000" in warning_call
-            assert "10000" in warning_call
+            warning_template, *warning_values = mock_warning.call_args.args
+            print(f"Warning message: {warning_template}")
+            assert "exceeds cap" in warning_template
+            assert warning_values == [50000, 10000, 10000]
     
     def test_uses_budget_when_below_cap(self, monkeypatch):
         """
@@ -6598,3 +6600,152 @@ class TestNativeReasoningPayload:
         )
 
         assert "additionalModelRequestFields" not in result.payload
+
+
+class TestReasoningMetadataLogging:
+    """Tests for safe, effective reasoning metadata logging."""
+
+    @pytest.mark.parametrize(
+        (
+            "model_id",
+            "thinking_config",
+            "fake_reasoning_enabled",
+            "expected_fields",
+        ),
+        [
+            (
+                "gpt-5.6-sol",
+                ThinkingConfig(enabled=True, budget_tokens=7000, effort="max"),
+                True,
+                {
+                    "thinking": "enabled",
+                    "effort": "max",
+                    "control": "native",
+                    "budget_tokens": "not_set",
+                },
+            ),
+            (
+                "gpt-5.6-sol",
+                ThinkingConfig(enabled=True),
+                True,
+                {
+                    "thinking": "disabled",
+                    "effort": "not_set",
+                    "control": "none",
+                    "budget_tokens": "not_set",
+                },
+            ),
+            (
+                "claude-sonnet-4.5",
+                ThinkingConfig(enabled=True, budget_tokens=50000, effort="high"),
+                True,
+                {
+                    "thinking": "enabled",
+                    "effort": "high",
+                    "control": "native+xml",
+                    "budget_tokens": "10000",
+                },
+            ),
+            (
+                "deepseek-3.2",
+                ThinkingConfig(enabled=True, effort="high"),
+                True,
+                {
+                    "thinking": "enabled",
+                    "effort": "not_set",
+                    "control": "xml",
+                    "budget_tokens": "4321",
+                },
+            ),
+            (
+                "deepseek-3.2",
+                ThinkingConfig(enabled=False, effort="none"),
+                True,
+                {
+                    "thinking": "disabled",
+                    "effort": "not_set",
+                    "control": "none",
+                    "budget_tokens": "not_set",
+                },
+            ),
+            (
+                "claude-sonnet-4.5",
+                ThinkingConfig(enabled=False, effort="none"),
+                True,
+                {
+                    "thinking": "disabled",
+                    "effort": "none",
+                    "control": "native",
+                    "budget_tokens": "not_set",
+                },
+            ),
+            (
+                "claude-sonnet-4.5",
+                ThinkingConfig(enabled=True, budget_tokens=7000, effort="high"),
+                False,
+                {
+                    "thinking": "enabled",
+                    "effort": "high",
+                    "control": "native",
+                    "budget_tokens": "not_set",
+                },
+            ),
+            (
+                "deepseek-3.2",
+                ThinkingConfig(enabled=True),
+                False,
+                {
+                    "thinking": "disabled",
+                    "effort": "not_set",
+                    "control": "none",
+                    "budget_tokens": "not_set",
+                },
+            ),
+        ],
+    )
+    def test_logs_one_safe_effective_summary(
+        self,
+        monkeypatch,
+        model_id,
+        thinking_config,
+        fake_reasoning_enabled,
+        expected_fields,
+    ):
+        """Each built payload emits one metadata-only INFO summary."""
+        monkeypatch.setattr(
+            "kiro.converters_core.FAKE_REASONING_ENABLED",
+            fake_reasoning_enabled,
+        )
+        monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_MAX_TOKENS", 4321)
+        monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000)
+        captured = StringIO()
+        sink_id = logger.add(captured, level="INFO", format="{message}")
+
+        try:
+            build_kiro_payload(
+                messages=[
+                    UnifiedMessage(role="user", content="secret thinking body")
+                ],
+                system_prompt="secret system prompt",
+                model_id=model_id,
+                tools=None,
+                conversation_id="test-conv-123",
+                profile_arn="arn:aws:test",
+                thinking_config=thinking_config,
+            )
+        finally:
+            logger.remove(sink_id)
+
+        output = captured.getvalue()
+        summaries = [
+            line for line in output.splitlines()
+            if line.startswith("Reasoning request:")
+        ]
+
+        assert len(summaries) == 1
+        summary = summaries[0]
+        assert f"model_id={model_id}" in summary
+        for key, value in expected_fields.items():
+            assert f"{key}={value}" in summary
+        assert "secret thinking body" not in output
+        assert "secret system prompt" not in output
