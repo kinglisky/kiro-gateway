@@ -6455,3 +6455,146 @@ class TestBuildKiroPayloadWithThinkingConfig:
         print(f"Checking for <max_thinking_length>7000</max_thinking_length> in content...")
         assert "<max_thinking_length>7000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestNativeReasoningPayload:
+    """Tests for model-specific native reasoning request fields."""
+
+    @pytest.mark.parametrize(
+        "model_id",
+        ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+    )
+    def test_gpt_5_6_uses_only_native_reasoning(self, model_id):
+        """GPT 5.6 models use the captured root field without legacy XML."""
+        result = build_kiro_payload(
+            messages=[UnifiedMessage(role="user", content="Test message")],
+            system_prompt="Keep the response concise.",
+            model_id=model_id,
+            tools=None,
+            conversation_id="test-conv-123",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(
+                enabled=True,
+                budget_tokens=7000,
+                effort="max",
+            ),
+        )
+
+        payload = result.payload
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+        assert payload["additionalModelRequestFields"] == {
+            "reasoning": {"effort": "max"}
+        }
+        assert content.startswith("Keep the response concise.")
+        assert content.endswith("Test message")
+        assert "<thinking_" not in content
+        assert "# Extended Thinking Mode" not in content
+
+    def test_claude_uses_native_reasoning_and_legacy_xml(self):
+        """Claude internal IDs use native reasoning while preserving legacy XML."""
+        result = build_kiro_payload(
+            messages=[UnifiedMessage(role="user", content="Test message")],
+            system_prompt="",
+            model_id="CLAUDE_SONNET_4_5",
+            tools=None,
+            conversation_id="test-conv-123",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(
+                enabled=True,
+                budget_tokens=7000,
+                effort="high",
+            ),
+        )
+
+        payload = result.payload
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+        assert payload["additionalModelRequestFields"] == {
+            "reasoning": {"effort": "high"}
+        }
+        assert "<thinking_mode>enabled</thinking_mode>" in content
+        assert "<max_thinking_length>7000</max_thinking_length>" in content
+
+    @pytest.mark.parametrize(
+        ("model_id", "expected_native_fields"),
+        [
+            (
+                "claude-sonnet-4.5",
+                {"reasoning": {"effort": "none"}},
+            ),
+            ("deepseek-3.2", None),
+        ],
+    )
+    def test_disabled_reasoning_omits_all_legacy_xml(
+        self, model_id, expected_native_fields
+    ):
+        """Explicitly disabled reasoning never emits legacy thinking XML."""
+        result = build_kiro_payload(
+            messages=[UnifiedMessage(role="user", content="Test message")],
+            system_prompt="Keep the response concise.",
+            model_id=model_id,
+            tools=None,
+            conversation_id="test-conv-123",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=False, effort="none"),
+        )
+
+        payload = result.payload
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+        assert "<thinking_" not in content
+        assert "# Extended Thinking Mode" not in content
+
+        if expected_native_fields is None:
+            assert "additionalModelRequestFields" not in payload
+            return
+
+        assert payload["additionalModelRequestFields"] == expected_native_fields
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "deepseek-3.2",
+            "minimax-m2.1",
+            "glm-5",
+            "qwen3-coder-next",
+            "gpt-5.6-sol-preview",
+        ],
+    )
+    def test_other_non_claude_model_keeps_only_legacy_xml(self, model_id):
+        """Unsupported non-Claude models never receive native reasoning fields."""
+        result = build_kiro_payload(
+            messages=[UnifiedMessage(role="user", content="Test message")],
+            system_prompt="",
+            model_id=model_id,
+            tools=None,
+            conversation_id="test-conv-123",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(
+                enabled=True,
+                budget_tokens=7000,
+                effort="high",
+            ),
+        )
+
+        payload = result.payload
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+        assert "additionalModelRequestFields" not in payload
+        assert "<thinking_mode>enabled</thinking_mode>" in content
+        assert "<max_thinking_length>7000</max_thinking_length>" in content
+
+    def test_missing_effort_omits_native_reasoning_field(self):
+        """Supported models omit the native field when effort is not configured."""
+        result = build_kiro_payload(
+            messages=[UnifiedMessage(role="user", content="Test message")],
+            system_prompt="",
+            model_id="claude-sonnet-4.5",
+            tools=None,
+            conversation_id="test-conv-123",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(),
+        )
+
+        assert "additionalModelRequestFields" not in result.payload

@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from kiro.config import HIDDEN_MODELS
+from kiro.config import HIDDEN_MODELS, KIRO_DEFAULT_REASONING_EFFORT
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
@@ -374,10 +374,11 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
     """
     Extract thinking configuration from Anthropic request.
     
-    Handles thinking parameter:
-    - {"type": "enabled", "budget_tokens": N} → enabled with budget
-    - {"type": "disabled"} → disabled
-    - None → enabled with default budget
+    Handles thinking and output_config parameters:
+    - thinking.type disabled maps to native effort none
+    - thinking.type enabled/adaptive uses output_config.effort or the env-backed default
+    - explicit output_config.effort works without thinking
+    - omitted thinking and effort preserve legacy defaults without native fields
     
     Args:
         request: Anthropic MessagesRequest
@@ -389,41 +390,47 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         >>> # No thinking specified → use defaults
         >>> request = AnthropicMessagesRequest(model="claude-sonnet-4.5", messages=[...], max_tokens=4096)
         >>> extract_thinking_config_from_anthropic(request)
-        ThinkingConfig(enabled=True, budget_tokens=None)
+        ThinkingConfig(enabled=True, budget_tokens=None, effort=None)
         
         >>> # Explicitly disabled
         >>> request.thinking = {"type": "disabled"}
         >>> extract_thinking_config_from_anthropic(request)
-        ThinkingConfig(enabled=False, budget_tokens=None)
+        ThinkingConfig(enabled=False, budget_tokens=None, effort="none")
         
         >>> # Enabled with custom budget
         >>> request.thinking = {"type": "enabled", "budget_tokens": 8000}
         >>> extract_thinking_config_from_anthropic(request)
-        ThinkingConfig(enabled=True, budget_tokens=8000)
+        ThinkingConfig(enabled=True, budget_tokens=8000, effort="high")
     """
-    if not request.thinking:
-        # No thinking specified → use defaults
-        return ThinkingConfig(enabled=True, budget_tokens=None)
-    
-    if not isinstance(request.thinking, dict):
-        # Invalid format → use defaults
-        return ThinkingConfig(enabled=True, budget_tokens=None)
-    
-    thinking_type = request.thinking.get("type")
-    
+    thinking = request.thinking if isinstance(request.thinking, dict) else {}
+    thinking_type = thinking.get("type")
+
     if thinking_type == "disabled":
         # Explicitly disabled
-        return ThinkingConfig(enabled=False, budget_tokens=None)
-    
-    if thinking_type == "enabled":
-        # Extract budget_tokens
-        budget = request.thinking.get("budget_tokens")
-        if budget:
-            logger.debug(f"Extracted thinking config from Anthropic: type='enabled', budget={budget}")
-        return ThinkingConfig(enabled=True, budget_tokens=budget)
-    
-    # Unknown type → use defaults
-    return ThinkingConfig(enabled=True, budget_tokens=None)
+        return ThinkingConfig(enabled=False, budget_tokens=None, effort="none")
+
+    output_effort = request.output_config.effort if request.output_config else None
+    if output_effort:
+        budget = thinking.get("budget_tokens")
+        return ThinkingConfig(
+            enabled=output_effort != "none",
+            budget_tokens=budget,
+            effort=output_effort,
+        )
+
+    if thinking_type not in ("enabled", "adaptive"):
+        return ThinkingConfig(enabled=True, budget_tokens=None)
+
+    budget = thinking.get("budget_tokens")
+    logger.debug(
+        f"Extracted thinking config from Anthropic: type='{thinking_type}', "
+        f"budget={budget}, effort='{KIRO_DEFAULT_REASONING_EFFORT}'"
+    )
+    return ThinkingConfig(
+        enabled=KIRO_DEFAULT_REASONING_EFFORT != "none",
+        budget_tokens=budget,
+        effort=KIRO_DEFAULT_REASONING_EFFORT,
+    )
 
 
 def anthropic_to_kiro(

@@ -1757,3 +1757,37 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+class TestOutputConfigParameter:
+    """Tests for the typed Anthropic output_config parameter."""
+
+    def test_valid_effort_uses_typed_model(self):
+        """Valid output_config exposes its effort as a typed attribute."""
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=1024,
+            output_config={"effort": "max"},
+        )
+
+        assert request.output_config is not None
+        assert request.output_config.effort == "max"
+
+    @pytest.mark.parametrize(
+        "output_config",
+        [
+            {"effort": "ultra"},
+            "max",
+            ["max"],
+        ],
+    )
+    def test_invalid_effort_or_structure_is_rejected(self, output_config):
+        """Invalid effort values and non-object structures fail validation."""
+        with pytest.raises(ValidationError):
+            AnthropicMessagesRequest(
+                model="claude-sonnet-4.5",
+                messages=[AnthropicMessage(role="user", content="test")],
+                max_tokens=1024,
+                output_config=output_config,
+            )

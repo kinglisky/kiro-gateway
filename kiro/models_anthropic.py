@@ -30,6 +30,8 @@ import time
 from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
+from kiro.reasoning_types import ReasoningEffort
+
 
 # ==================================================================================================
 # Content Block Models
@@ -294,6 +296,14 @@ class SystemContentBlock(BaseModel):
 SystemPrompt = Union[str, List[SystemContentBlock], List[Dict[str, Any]]]
 
 
+class AnthropicOutputConfig(BaseModel):
+    """Native reasoning configuration for an Anthropic request."""
+
+    effort: Optional[ReasoningEffort] = None
+
+    model_config = {"extra": "allow"}
+
+
 class AnthropicMessagesRequest(BaseModel):
     """
     Request to Anthropic Messages API (/v1/messages).
@@ -323,6 +333,7 @@ class AnthropicMessagesRequest(BaseModel):
 
     # Extended thinking (official Anthropic parameter)
     thinking: Optional[Dict[str, Any]] = None
+    output_config: Optional[AnthropicOutputConfig] = None
 
     # Tools
     tools: Optional[List[AnthropicTool]] = None

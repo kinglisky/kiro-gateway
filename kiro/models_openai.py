@@ -125,6 +125,17 @@ class Tool(BaseModel):
     model_config = {"extra": "allow"}
 
 
+OpenAIReasoningEffort = Literal[
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
+
+
 class ChatCompletionRequest(BaseModel):
     """
     Request for response generation in OpenAI Chat Completions API format.
@@ -166,7 +177,7 @@ class ChatCompletionRequest(BaseModel):
     
     # Reasoning (OpenAI reasoning models)
     # Supports all official reasoning_effort levels from OpenAI API
-    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = None
+    reasoning_effort: Optional[OpenAIReasoningEffort] = None
     
     # Tools (function calling)
     tools: Optional[List[Tool]] = None

@@ -10,6 +10,19 @@ import os
 from unittest.mock import patch
 
 
+@pytest.fixture
+def restore_reasoning_effort_config(monkeypatch):
+    """Restore config after tests that reload it with patched environment values."""
+    yield
+
+    monkeypatch.undo()
+
+    from importlib import reload
+    import kiro.config as config_module
+
+    reload(config_module)
+
+
 class TestLogLevelConfig:
     """Tests for LOG_LEVEL configuration."""
     
@@ -124,6 +137,59 @@ class TestLogLevelConfig:
             
             print(f"LOG_LEVEL: {config_module.LOG_LEVEL}")
             assert config_module.LOG_LEVEL == "CRITICAL"
+
+
+@pytest.mark.usefixtures("restore_reasoning_effort_config")
+class TestDefaultReasoningEffortConfig:
+    """Tests for KIRO_DEFAULT_REASONING_EFFORT configuration."""
+
+    def test_defaults_to_high(self, monkeypatch):
+        """Missing configuration uses high reasoning effort."""
+        monkeypatch.delenv("KIRO_DEFAULT_REASONING_EFFORT", raising=False)
+
+        from importlib import reload
+        import kiro.config as config_module
+
+        reload(config_module)
+
+        assert config_module.KIRO_DEFAULT_REASONING_EFFORT == "high"
+
+    def test_invalid_value_falls_back_to_high(self, monkeypatch):
+        """Invalid native effort values do not reach Kiro requests."""
+        monkeypatch.setenv("KIRO_DEFAULT_REASONING_EFFORT", "invalid")
+
+        from importlib import reload
+        import kiro.config as config_module
+
+        reload(config_module)
+
+        assert config_module.KIRO_DEFAULT_REASONING_EFFORT == "high"
+
+    def test_reads_environment_override(self, monkeypatch):
+        """Environment configuration overrides the default effort."""
+        monkeypatch.setenv("KIRO_DEFAULT_REASONING_EFFORT", "xhigh")
+
+        from importlib import reload
+        import kiro.config as config_module
+
+        reload(config_module)
+
+        assert config_module.KIRO_DEFAULT_REASONING_EFFORT == "xhigh"
+
+    def test_previous_override_does_not_leak(self):
+        """Each config test starts with a module matching the real environment."""
+        import kiro.config as config_module
+
+        configured_effort = os.getenv(
+            "KIRO_DEFAULT_REASONING_EFFORT",
+            "high",
+        ).lower()
+        supported_efforts = {"none", "low", "medium", "high", "xhigh", "max"}
+        expected_effort = (
+            configured_effort if configured_effort in supported_efforts else "high"
+        )
+
+        assert config_module.KIRO_DEFAULT_REASONING_EFFORT == expected_effort
 
 
 class TestToolDescriptionMaxLengthConfig:

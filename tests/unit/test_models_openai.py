@@ -1070,7 +1070,7 @@ class TestReasoningEffort:
         """
         print("Testing all valid reasoning_effort values...")
         
-        for effort in ["none", "minimal", "low", "medium", "high", "xhigh"]:
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"]:
             print(f"  Testing reasoning_effort='{effort}'...")
             request = ChatCompletionRequest(
                 model="claude-sonnet-4.5",

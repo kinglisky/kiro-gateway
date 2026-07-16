@@ -45,6 +45,7 @@ from kiro.config import (
     AUTO_TRIM_PAYLOAD,
 )
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
+from kiro.reasoning_types import ReasoningEffort
 
 
 # ==================================================================================================
@@ -54,30 +55,32 @@ from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 @dataclass
 class ThinkingConfig:
     """
-    Unified thinking configuration for fake reasoning.
+    Unified configuration for native reasoning and legacy XML thinking.
     
     This configuration is created by API-specific adapters (OpenAI, Anthropic)
-    and passed to the core layer for thinking tag injection.
+    and passed to the core layer for request construction.
     
     Attributes:
         enabled: Whether to inject thinking tags into the request
-        budget_tokens: Token budget for thinking (None = use FAKE_REASONING_MAX_TOKENS default)
+        budget_tokens: Token budget for legacy XML thinking tags
+        effort: Native Kiro reasoning effort, or None when not configured
     
     Examples:
         >>> # Default configuration (enabled with default budget)
         >>> ThinkingConfig()
-        ThinkingConfig(enabled=True, budget_tokens=None)
+        ThinkingConfig(enabled=True, budget_tokens=None, effort=None)
         
         >>> # Disabled by client (reasoning_effort="none" or thinking.type="disabled")
         >>> ThinkingConfig(enabled=False, budget_tokens=None)
-        ThinkingConfig(enabled=False, budget_tokens=None)
+        ThinkingConfig(enabled=False, budget_tokens=None, effort=None)
         
         >>> # Custom budget from client
         >>> ThinkingConfig(enabled=True, budget_tokens=8000)
-        ThinkingConfig(enabled=True, budget_tokens=8000)
+        ThinkingConfig(enabled=True, budget_tokens=8000, effort=None)
     """
     enabled: bool = True
     budget_tokens: Optional[int] = None
+    effort: Optional[ReasoningEffort] = None
 
 
 @dataclass
@@ -300,6 +303,32 @@ def extract_images_from_content(content: Any) -> List[Dict[str, Any]]:
 # ==================================================================================================
 # Thinking Mode Support (Fake Reasoning)
 # ==================================================================================================
+
+GPT_5_6_REASONING_MODEL_IDS = frozenset({
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+})
+
+
+def is_claude_model(model_id: str) -> bool:
+    """Return whether a resolved Kiro model ID belongs to Claude."""
+    normalized_model_id = model_id.lower()
+    return normalized_model_id.startswith(("claude-", "claude_"))
+
+
+def supports_native_reasoning(model_id: str) -> bool:
+    """Return whether a resolved Kiro model ID accepts native reasoning effort."""
+    if is_claude_model(model_id):
+        return True
+
+    return model_id in GPT_5_6_REASONING_MODEL_IDS
+
+
+def uses_legacy_thinking_tags(model_id: str) -> bool:
+    """Return whether the model should retain legacy XML thinking controls."""
+    return model_id not in GPT_5_6_REASONING_MODEL_IDS
+
 
 def get_thinking_system_prompt_addition() -> str:
     """
@@ -1443,10 +1472,12 @@ def build_kiro_payload(
     if tool_documentation:
         full_system_prompt = full_system_prompt + tool_documentation if full_system_prompt else tool_documentation.strip()
     
-    # Add thinking mode legitimization to system prompt if enabled
-    thinking_system_addition = get_thinking_system_prompt_addition()
-    if thinking_system_addition:
-        full_system_prompt = full_system_prompt + thinking_system_addition if full_system_prompt else thinking_system_addition.strip()
+    # GPT 5.6 uses native reasoning only; other models retain XML when thinking is enabled.
+    legacy_thinking_enabled = uses_legacy_thinking_tags(model_id)
+    if legacy_thinking_enabled and thinking_config.enabled:
+        thinking_system_addition = get_thinking_system_prompt_addition()
+        if thinking_system_addition:
+            full_system_prompt = full_system_prompt + thinking_system_addition if full_system_prompt else thinking_system_addition.strip()
     
     # Add truncation recovery legitimization to system prompt if enabled
     truncation_system_addition = get_truncation_recovery_system_addition()
@@ -1546,8 +1577,8 @@ def build_kiro_payload(
         if tool_results:
             user_input_context["toolResults"] = tool_results
     
-    # Inject thinking tags if enabled (only for the current/last user message)
-    if current_message.role == "user":
+    # Inject legacy thinking tags only for models that still use them.
+    if current_message.role == "user" and legacy_thinking_enabled:
         current_content = inject_thinking_tags(current_content, thinking_config)
     
     # Build userInputMessage
@@ -1583,6 +1614,12 @@ def build_kiro_payload(
     # Add profileArn
     if profile_arn:
         payload["profileArn"] = profile_arn
+
+    # Native reasoning fields are supported by Claude and the three GPT 5.6 models.
+    if thinking_config.effort and supports_native_reasoning(model_id):
+        payload["additionalModelRequestFields"] = {
+            "reasoning": {"effort": thinking_config.effort}
+        }
 
     # Payload size guard — auto-trim if enabled
     if AUTO_TRIM_PAYLOAD:

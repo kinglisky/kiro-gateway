@@ -1772,6 +1772,7 @@ class TestExtractThinkingConfigFromAnthropic:
         print(f"Comparing: enabled={config.enabled}, budget_tokens={config.budget_tokens}")
         assert config.enabled is True
         assert config.budget_tokens is None
+        assert config.effort is None
     
     def test_thinking_enabled_with_budget(self):
         """
@@ -1832,6 +1833,7 @@ class TestExtractThinkingConfigFromAnthropic:
         print(f"Comparing: enabled={config.enabled}, budget_tokens={config.budget_tokens}")
         assert config.enabled is False
         assert config.budget_tokens is None
+        assert config.effort == "none"
     
     def test_thinking_invalid_type(self):
         """
@@ -1852,6 +1854,59 @@ class TestExtractThinkingConfigFromAnthropic:
         print(f"Comparing: enabled={config.enabled}, budget_tokens={config.budget_tokens}")
         assert config.enabled is True
         assert config.budget_tokens is None
+
+    @pytest.mark.parametrize("thinking_type", ["enabled", "adaptive"])
+    def test_thinking_uses_environment_default_effort(
+        self, monkeypatch, thinking_type
+    ):
+        """Enabled and adaptive thinking use the env-backed default effort."""
+        monkeypatch.setattr(
+            "kiro.converters_anthropic.KIRO_DEFAULT_REASONING_EFFORT",
+            "max",
+            raising=False,
+        )
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=1024,
+            thinking={"type": thinking_type},
+        )
+
+        config = extract_thinking_config_from_anthropic(request)
+
+        assert config.effort == "max"
+
+    def test_output_config_effort_takes_precedence(self, monkeypatch):
+        """Explicit Anthropic output_config effort overrides the env default."""
+        monkeypatch.setattr(
+            "kiro.converters_anthropic.KIRO_DEFAULT_REASONING_EFFORT",
+            "high",
+            raising=False,
+        )
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=1024,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "max"},
+        )
+
+        config = extract_thinking_config_from_anthropic(request)
+
+        assert config.effort == "max"
+
+    def test_output_config_effort_works_without_thinking(self):
+        """Explicit output_config effort works when thinking is omitted."""
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=1024,
+            output_config={"effort": "xhigh"},
+        )
+
+        config = extract_thinking_config_from_anthropic(request)
+
+        assert config.effort == "xhigh"
     
 
 
@@ -1884,3 +1939,26 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+    def test_claude_sends_native_effort_and_keeps_legacy_xml(self):
+        """Anthropic Claude requests use native effort and legacy XML together."""
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="Test message")],
+            max_tokens=1024,
+            thinking={"type": "enabled", "budget_tokens": 6000},
+            output_config={"effort": "high"},
+        )
+
+        payload = anthropic_to_kiro(
+            request,
+            "test-conv-123",
+            "arn:aws:test",
+        )
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+        assert payload["additionalModelRequestFields"] == {
+            "reasoning": {"effort": "high"}
+        }
+        assert "<thinking_mode>enabled</thinking_mode>" in content
+        assert "<max_thinking_length>6000</max_thinking_length>" in content

@@ -35,7 +35,13 @@ from loguru import logger
 
 from kiro.config import HIDDEN_MODELS
 from kiro.model_resolver import get_model_id_for_kiro
-from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
+from kiro.models_openai import (
+    ChatMessage,
+    ChatCompletionRequest,
+    OpenAIReasoningEffort,
+    Tool,
+)
+from kiro.reasoning_types import ReasoningEffort
 
 # Import from core - reuse shared logic
 from kiro.converters_core import (
@@ -306,7 +312,7 @@ def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
     
     Args:
         max_tokens: Maximum output tokens for the request
-        effort: Reasoning effort level ("none", "minimal", "low", "medium", "high", "xhigh")
+        effort: OpenAI reasoning effort level
     
     Returns:
         Thinking budget in tokens
@@ -324,8 +330,17 @@ def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
         "medium": 0.50,   # 50% - balanced reasoning
         "high": 0.80,     # 80% - deep reasoning
         "xhigh": 0.95,    # 95% - maximum reasoning depth
+        "max": 0.95,      # 95% - preserve output space for legacy XML reasoning
     }
     return int(max_tokens * percent[effort])
+
+
+def to_native_reasoning_effort(effort: OpenAIReasoningEffort) -> ReasoningEffort:
+    """Map OpenAI compatibility effort names to Kiro native values."""
+    if effort == "minimal":
+        return "low"
+
+    return effort
 
 
 def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> ThinkingConfig:
@@ -334,7 +349,7 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
     
     Handles reasoning_effort parameter:
     - "none" → disabled (no thinking tags injected)
-    - "minimal", "low", "medium", "high", "xhigh" → enabled with percentage-based budget
+    - "minimal", "low", "medium", "high", "xhigh", "max" → enabled with a legacy XML budget
     - None (not specified) → enabled with default budget
     
     Args:
@@ -347,26 +362,28 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
         >>> # No reasoning_effort specified → use defaults
         >>> request = ChatCompletionRequest(model="claude-sonnet-4.5", messages=[...])
         >>> extract_thinking_config_from_openai(request)
-        ThinkingConfig(enabled=True, budget_tokens=None)
+        ThinkingConfig(enabled=True, budget_tokens=None, effort=None)
         
         >>> # Explicitly disabled
         >>> request.reasoning_effort = "none"
         >>> extract_thinking_config_from_openai(request)
-        ThinkingConfig(enabled=False, budget_tokens=None)
+        ThinkingConfig(enabled=False, budget_tokens=None, effort="none")
         
         >>> # Custom budget from reasoning_effort
         >>> request.reasoning_effort = "high"
         >>> request.max_tokens = 4096
         >>> extract_thinking_config_from_openai(request)
-        ThinkingConfig(enabled=True, budget_tokens=3276)  # 80% of 4096
+        ThinkingConfig(enabled=True, budget_tokens=3276, effort="high")
     """
     if not request.reasoning_effort:
         # No reasoning_effort specified → use defaults
         return ThinkingConfig(enabled=True, budget_tokens=None)
     
+    native_effort = to_native_reasoning_effort(request.reasoning_effort)
+
     if request.reasoning_effort == "none":
         # Explicitly disabled
-        return ThinkingConfig(enabled=False, budget_tokens=None)
+        return ThinkingConfig(enabled=False, budget_tokens=None, effort=native_effort)
     
     # Calculate budget from reasoning_effort
     # Get max_tokens from request (OUTPUT tokens limit)
@@ -383,7 +400,11 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
         f"max_tokens={max_tokens}, budget={budget}"
     )
     
-    return ThinkingConfig(enabled=True, budget_tokens=budget)
+    return ThinkingConfig(
+        enabled=True,
+        budget_tokens=budget,
+        effort=native_effort,
+    )
 
 
 # ==================================================================================================

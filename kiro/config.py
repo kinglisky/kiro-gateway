@@ -27,8 +27,10 @@ Loads environment variables and provides typed access to them.
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import cast, Dict, List, Optional
 from dotenv import load_dotenv
+
+from kiro.reasoning_types import REASONING_EFFORT_VALUES, ReasoningEffort
 
 # Load environment variables
 load_dotenv()
@@ -419,6 +421,21 @@ def _warn_timeout_configuration():
         print(warning_text, file=sys.stderr)
 
 # ==================================================================================================
+# Native Reasoning Settings
+# ==================================================================================================
+
+_DEFAULT_REASONING_EFFORT_RAW = os.getenv(
+    "KIRO_DEFAULT_REASONING_EFFORT",
+    "high",
+).lower()
+KIRO_DEFAULT_REASONING_EFFORT: ReasoningEffort = (
+    cast(ReasoningEffort, _DEFAULT_REASONING_EFFORT_RAW)
+    if _DEFAULT_REASONING_EFFORT_RAW in REASONING_EFFORT_VALUES
+    else "high"
+)
+
+
+# ==================================================================================================
 # Fake Reasoning Settings (Extended Thinking via Tag Injection)
 # ==================================================================================================
 
@@ -581,4 +598,3 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
-

@@ -1694,6 +1694,12 @@ class TestReasoningEffortToBudget:
         
         print(f"Comparing: expected={expected}, got={result}")
         assert result == expected
+
+    def test_max_returns_95_percent(self):
+        """Native max retains a 5% legacy XML output safety margin."""
+        result = reasoning_effort_to_budget(10000, "max")
+
+        assert result == 9500
     
     def test_adapts_to_different_max_tokens(self):
         """
@@ -1836,6 +1842,47 @@ class TestExtractThinkingConfigFromOpenAI:
         print(f"Comparing: budget_tokens={config.budget_tokens}, expected={expected_budget}")
         assert config.budget_tokens == expected_budget
 
+    @pytest.mark.parametrize(
+        ("requested_effort", "native_effort"),
+        [
+            ("none", "none"),
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "max"),
+        ],
+    )
+    def test_maps_reasoning_effort_to_native_field(
+        self, requested_effort, native_effort
+    ):
+        """OpenAI effort maps directly except compatibility aliases."""
+        request = ChatCompletionRequest(
+            model="gpt-5.6-sol",
+            messages=[ChatMessage(role="user", content="test")],
+            max_tokens=4096,
+            reasoning_effort=requested_effort,
+        )
+
+        config = extract_thinking_config_from_openai(request)
+
+        assert config.effort == native_effort
+
+    def test_max_keeps_native_effort_with_safe_legacy_budget(self):
+        """Claude max uses native max and a 95% legacy XML budget."""
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4.5",
+            messages=[ChatMessage(role="user", content="test")],
+            max_tokens=10000,
+            reasoning_effort="max",
+        )
+
+        config = extract_thinking_config_from_openai(request)
+
+        assert config.budget_tokens == 9500
+        assert config.effort == "max"
+
 
 class TestBuildKiroPayloadIntegration:
     """Integration tests for build_kiro_payload with thinking config."""
@@ -1872,3 +1919,24 @@ class TestBuildKiroPayloadIntegration:
         print(f"Checking for <max_thinking_length>{expected_budget}</max_thinking_length>...")
         assert f"<max_thinking_length>{expected_budget}</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+    def test_gpt_5_6_sends_native_effort_without_legacy_xml(self):
+        """OpenAI GPT 5.6 requests use only the native Kiro reasoning field."""
+        request = ChatCompletionRequest(
+            model="gpt-5.6-sol",
+            messages=[ChatMessage(role="user", content="Test message")],
+            reasoning_effort="max",
+        )
+
+        payload = build_kiro_payload(
+            request_data=request,
+            conversation_id="test-conv-123",
+            profile_arn="arn:aws:test",
+        )
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+
+        assert payload["additionalModelRequestFields"] == {
+            "reasoning": {"effort": "max"}
+        }
+        assert content.endswith("Test message")
+        assert "<thinking_" not in content
