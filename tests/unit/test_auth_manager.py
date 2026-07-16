@@ -9,11 +9,34 @@ import asyncio
 import json
 import pytest
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.config import TOKEN_REFRESH_THRESHOLD, get_aws_sso_oidc_url
+
+
+TEST_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/test-profile"
+
+
+def _write_enterprise_token(home: Path, data: dict[str, object]) -> Path:
+    """Write an Enterprise Kiro IDE token to the default cache path."""
+    token_path = home / ".aws" / "sso" / "cache" / "kiro-auth-token.json"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(json.dumps(data), encoding="utf-8")
+    return token_path
+
+
+def _write_macos_kiro_profile(home: Path, data: object) -> Path:
+    """Write a Kiro IDE profile to the macOS user-data path."""
+    profile_path = (
+        home / "Library" / "Application Support" / "Kiro" / "User"
+        / "globalStorage" / "kiro.kiroagent" / "profile.json"
+    )
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(json.dumps(data), encoding="utf-8")
+    return profile_path
 
 
 class TestKiroAuthManagerInitialization:
@@ -82,6 +105,11 @@ class TestKiroAuthManagerInitialization:
 
 class TestKiroAuthManagerCredentialsFile:
     """Tests for loading credentials from file."""
+
+    @pytest.fixture(autouse=True)
+    def _use_macos_profile_path(self, monkeypatch):
+        """Keep profile-path tests deterministic on every test platform."""
+        monkeypatch.setattr("kiro.auth.sys.platform", "darwin")
     
     def test_load_credentials_from_file(self, temp_creds_file):
         """
@@ -121,6 +149,304 @@ class TestKiroAuthManagerCredentialsFile:
         print("Verification: Fallback refresh_token is used...")
         print(f"Comparing refresh_token: Expected 'fallback_token', Got '{manager._refresh_token}'")
         assert manager._refresh_token == "fallback_token"
+
+    def test_loads_profile_arn_from_default_kiro_profile(self, tmp_path, monkeypatch):
+        """
+        What it does: Loads a missing Enterprise profile ARN from Kiro IDE state.
+        Purpose: Support current IdC token caches that no longer embed profileArn.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        token_path = _write_enterprise_token(
+            tmp_path,
+            {"refreshToken": "refresh", "clientIdHash": "client-hash"},
+        )
+        _write_macos_kiro_profile(tmp_path, {"arn": TEST_PROFILE_ARN})
+
+        manager = KiroAuthManager(creds_file=str(token_path))
+
+        assert manager.profile_arn == TEST_PROFILE_ARN
+
+    @pytest.mark.parametrize(
+        "profile_data",
+        [
+            None,
+            [],
+            {},
+            {"arn": ""},
+            {"arn": 123},
+            {"arn": "not-an-arn"},
+            {
+                "arn": (
+                    "arn:aws:codewhisperer:-:123456789012:profile/test-profile"
+                )
+            },
+            {
+                "arn": (
+                    "arn:aws:codewhisperer:us-east-1:123456789012:profile/"
+                    + "a" * 129
+                )
+            },
+        ],
+    )
+    def test_ignores_invalid_default_kiro_profile(
+        self, tmp_path, monkeypatch, profile_data
+    ):
+        """
+        What it does: Rejects missing, malformed, or invalid Kiro profile data.
+        Purpose: Prevent untrusted local state from entering upstream requests.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        token_path = _write_enterprise_token(
+            tmp_path,
+            {"refreshToken": "refresh", "clientIdHash": "client-hash"},
+        )
+        if profile_data is not None:
+            _write_macos_kiro_profile(tmp_path, profile_data)
+
+        manager = KiroAuthManager(creds_file=str(token_path))
+
+        assert manager.profile_arn is None
+
+    def test_does_not_load_profile_for_non_default_credentials(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        What it does: Leaves copied Enterprise credentials without a profile ARN.
+        Purpose: Avoid attaching the active IDE profile to another account.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        token_path = tmp_path / "copied-token.json"
+        token_path.write_text(
+            json.dumps({"refreshToken": "refresh", "clientIdHash": "client-hash"}),
+            encoding="utf-8",
+        )
+        _write_macos_kiro_profile(tmp_path, {"arn": TEST_PROFILE_ARN})
+
+        manager = KiroAuthManager(creds_file=str(token_path))
+
+        assert manager.profile_arn is None
+
+    def test_embedded_profile_arn_takes_priority(self, tmp_path, monkeypatch):
+        """
+        What it does: Keeps the profile ARN embedded in Enterprise credentials.
+        Purpose: Preserve account-specific data over the active IDE fallback.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        embedded_arn = TEST_PROFILE_ARN.replace("test-profile", "embedded-profile")
+        token_path = _write_enterprise_token(
+            tmp_path,
+            {
+                "refreshToken": "refresh",
+                "clientIdHash": "client-hash",
+                "profileArn": embedded_arn,
+            },
+        )
+        _write_macos_kiro_profile(tmp_path, {"arn": TEST_PROFILE_ARN})
+
+        manager = KiroAuthManager(creds_file=str(token_path))
+
+        assert manager.profile_arn == embedded_arn
+
+    def test_explicit_profile_arn_takes_priority(self, tmp_path, monkeypatch):
+        """
+        What it does: Keeps an explicitly configured Enterprise profile ARN.
+        Purpose: Preserve per-account configuration over active IDE state.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        token_path = _write_enterprise_token(
+            tmp_path,
+            {"refreshToken": "refresh", "clientIdHash": "client-hash"},
+        )
+        _write_macos_kiro_profile(tmp_path, {"arn": TEST_PROFILE_ARN})
+        explicit_arn = TEST_PROFILE_ARN.replace("test-profile", "explicit-profile")
+
+        manager = KiroAuthManager(
+            creds_file=str(token_path),
+            profile_arn=explicit_arn,
+        )
+
+        assert manager.profile_arn == explicit_arn
+
+    @pytest.mark.parametrize("file_profile_arn", ["", "   "])
+    def test_empty_file_profile_does_not_override_explicit_profile(
+        self, tmp_path, monkeypatch, file_profile_arn
+    ):
+        """
+        What it does: Keeps explicit ARN when the token cache contains an empty value.
+        Purpose: Prevent the active IDE profile from replacing account configuration.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        explicit_arn = TEST_PROFILE_ARN.replace("test-profile", "explicit-profile")
+        token_path = _write_enterprise_token(
+            tmp_path,
+            {
+                "refreshToken": "refresh",
+                "clientIdHash": "client-hash",
+                "profileArn": file_profile_arn,
+            },
+        )
+        _write_macos_kiro_profile(tmp_path, {"arn": TEST_PROFILE_ARN})
+
+        manager = KiroAuthManager(
+            creds_file=str(token_path),
+            profile_arn=explicit_arn,
+        )
+
+        assert manager.profile_arn == explicit_arn
+
+    def test_default_cache_without_client_id_hash_does_not_load_ide_profile(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        What it does: Skips IDE profile fallback for non-Enterprise cache data.
+        Purpose: Restrict fallback to identity-linked Enterprise credentials.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        token_path = _write_enterprise_token(
+            tmp_path,
+            {"refreshToken": "refresh"},
+        )
+        _write_macos_kiro_profile(tmp_path, {"arn": TEST_PROFILE_ARN})
+
+        manager = KiroAuthManager(creds_file=str(token_path))
+
+        assert manager.profile_arn is None
+
+    @pytest.mark.parametrize(
+        "credentials",
+        [
+            {"clientIdHash": None},
+            {"clientIdHash": ""},
+            {"clientIdHash": "   "},
+            {"clientIdHash": 123},
+            {"clientIdHash": "client-hash", "profileArn": 123},
+            {"clientIdHash": "client-hash", "profileArn": {}},
+        ],
+    )
+    def test_invalid_identity_fields_do_not_load_ide_profile(
+        self, tmp_path, monkeypatch, credentials
+    ):
+        """
+        What it does: Rejects malformed identity linkage in the token cache.
+        Purpose: Prevent credentials from inheriting the active IDE account.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        token_path = _write_enterprise_token(
+            tmp_path,
+            {"refreshToken": "refresh", **credentials},
+        )
+        _write_macos_kiro_profile(tmp_path, {"arn": TEST_PROFILE_ARN})
+
+        manager = KiroAuthManager(creds_file=str(token_path))
+
+        assert manager.profile_arn is None
+
+    def test_ignores_invalid_kiro_profile_json(self, tmp_path, monkeypatch):
+        """
+        What it does: Ignores syntactically invalid Kiro profile JSON.
+        Purpose: Keep startup resilient when IDE state is partially written.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        token_path = _write_enterprise_token(
+            tmp_path,
+            {"refreshToken": "refresh", "clientIdHash": "client-hash"},
+        )
+        profile_path = _write_macos_kiro_profile(tmp_path, {})
+        profile_path.write_text("{", encoding="utf-8")
+
+        manager = KiroAuthManager(creds_file=str(token_path))
+
+        assert manager.profile_arn is None
+
+    def test_profile_discovery_failure_does_not_stop_credentials_loading(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        What it does: Continues loading credentials after profile discovery fails.
+        Purpose: Keep optional IDE state isolated from required token fields.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        token_path = _write_enterprise_token(
+            tmp_path,
+            {
+                "refreshToken": "refresh",
+                "clientIdHash": "client-hash",
+                "clientId": "client-id",
+                "clientSecret": "client-secret",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            },
+        )
+
+        with patch("kiro.auth._get_kiro_profile_paths", side_effect=OSError("denied")):
+            manager = KiroAuthManager(creds_file=str(token_path))
+
+        assert manager._client_id == "client-id"
+        assert manager._client_secret == "client-secret"
+        assert manager._expires_at == datetime(2099, 1, 1, tzinfo=timezone.utc)
+
+    def test_non_utf8_profile_does_not_stop_credentials_loading(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        What it does: Ignores a Kiro profile that is not valid UTF-8.
+        Purpose: Keep optional IDE state isolated from required token fields.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        token_path = _write_enterprise_token(
+            tmp_path,
+            {
+                "refreshToken": "refresh",
+                "clientIdHash": "client-hash",
+                "clientId": "client-id",
+                "clientSecret": "client-secret",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            },
+        )
+        profile_path = _write_macos_kiro_profile(tmp_path, {})
+        profile_path.write_bytes(b"\xff")
+
+        manager = KiroAuthManager(creds_file=str(token_path))
+
+        assert manager._client_id == "client-id"
+        assert manager._client_secret == "client-secret"
+        assert manager._expires_at == datetime(2099, 1, 1, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize(
+        ("platform_name", "sys_platform"),
+        [("windows", "win32"), ("linux", "linux")],
+    )
+    def test_loads_profile_arn_from_other_desktop_paths(
+        self, tmp_path, monkeypatch, platform_name, sys_platform
+    ):
+        """
+        What it does: Loads Enterprise profile ARN from Windows and Linux paths.
+        Purpose: Keep Kiro IDE credential discovery portable across supported OSes.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("kiro.auth.sys.platform", sys_platform)
+        monkeypatch.delenv("APPDATA", raising=False)
+        token_path = _write_enterprise_token(
+            tmp_path,
+            {"refreshToken": "refresh", "clientIdHash": "client-hash"},
+        )
+        roots = {
+            "windows": tmp_path / "AppData" / "Roaming" / "Kiro",
+            "linux": tmp_path / ".config" / "Kiro",
+        }
+        if platform_name == "windows":
+            monkeypatch.setenv("APPDATA", str(tmp_path / "AppData" / "Roaming"))
+        if platform_name == "linux":
+            xdg_config = tmp_path / "xdg-config"
+            monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
+            roots[platform_name] = xdg_config / "Kiro"
+        profile_path = roots[platform_name] / "User" / "globalStorage"
+        profile_path = profile_path / "kiro.kiroagent" / "profile.json"
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(json.dumps({"arn": TEST_PROFILE_ARN}), encoding="utf-8")
+
+        manager = KiroAuthManager(creds_file=str(token_path))
+
+        assert manager.profile_arn == TEST_PROFILE_ARN
 
 
 class TestKiroAuthManagerTokenExpiration:
@@ -1065,6 +1391,74 @@ class TestKiroAuthManagerAwsSsoOidcRefresh:
             
             print("Verification: refresh_token updated...")
             assert manager._refresh_token == "new_aws_sso_refresh_token"
+
+    @pytest.mark.asyncio
+    async def test_refresh_token_aws_sso_oidc_persists_profile_arn(
+        self, tmp_path, mock_aws_sso_oidc_token_response
+    ):
+        """
+        What it does: Updates and persists profileArn returned by IdC refresh.
+        Purpose: Keep Enterprise credentials complete after token rotation.
+        """
+        credentials_path = tmp_path / "credentials.json"
+        credentials_path.write_text(
+            json.dumps(
+                {
+                    "refreshToken": "old-refresh",
+                    "clientId": "client-id",
+                    "clientSecret": "client-secret",
+                }
+            ),
+            encoding="utf-8",
+        )
+        manager = KiroAuthManager(creds_file=str(credentials_path))
+        response_data = mock_aws_sso_oidc_token_response()
+        response_data["profileArn"] = TEST_PROFILE_ARN
+        mock_response = AsyncMock(status_code=200)
+        mock_response.json = Mock(return_value=response_data)
+
+        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+            await manager._do_aws_sso_oidc_refresh()
+
+        persisted = json.loads(credentials_path.read_text(encoding="utf-8"))
+        assert manager.profile_arn == TEST_PROFILE_ARN
+        assert persisted["profileArn"] == TEST_PROFILE_ARN
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("response_profile", [None, "", "   ", "not-an-arn"])
+    async def test_refresh_token_aws_sso_oidc_keeps_existing_profile_arn(
+        self, response_profile, mock_aws_sso_oidc_token_response
+    ):
+        """
+        What it does: Preserves profile ARN when IdC omits a usable replacement.
+        Purpose: Prevent token refresh from clearing valid account identity.
+        """
+        manager = KiroAuthManager(
+            refresh_token="old-refresh",
+            profile_arn=TEST_PROFILE_ARN,
+            client_id="client-id",
+            client_secret="client-secret",
+        )
+        response_data = mock_aws_sso_oidc_token_response()
+        if response_profile is not None:
+            response_data["profileArn"] = response_profile
+        mock_response = AsyncMock(status_code=200)
+        mock_response.json = Mock(return_value=response_data)
+
+        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+            await manager._do_aws_sso_oidc_refresh()
+
+        assert manager.profile_arn == TEST_PROFILE_ARN
     
     @pytest.mark.asyncio
     async def test_refresh_token_aws_sso_oidc_calculates_expiration(self, mock_aws_sso_oidc_token_response):
@@ -2092,6 +2486,7 @@ class TestKiroAuthManagerSaveCredentialsToSqlite:
         manager._access_token = "new_access_token"
         manager._refresh_token = "new_refresh_token"
         manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        manager._profile_arn = TEST_PROFILE_ARN
         
         print("Action: Calling _save_credentials_to_sqlite()...")
         manager._save_credentials_to_sqlite()
@@ -2111,6 +2506,22 @@ class TestKiroAuthManagerSaveCredentialsToSqlite:
         
         print(f"Comparing refresh_token: Expected 'new_refresh_token', Got '{saved_data['refresh_token']}'")
         assert saved_data['refresh_token'] == "new_refresh_token"
+        assert saved_data["profile_arn"] == TEST_PROFILE_ARN
+
+        manager._profile_arn = "   "
+        manager._save_credentials_to_sqlite()
+
+        conn = sqlite3.connect(str(db_file))
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM auth_kv WHERE key = ?",
+            ("codewhisperer:odic:token",),
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        assert row is not None
+        assert json.loads(row[0])["profile_arn"] == TEST_PROFILE_ARN
     
     def test_save_credentials_to_sqlite_handles_missing_database(self, tmp_path):
         """
@@ -4250,4 +4661,3 @@ class TestAPIRegionPriorityHierarchy:
         print(f"  - default=ap-south-1 (parameter)")
         print(f"Result: api_host={manager5._api_host}")
         assert "ap-south-1" in manager5._api_host
-

@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pathlib import Path
@@ -63,6 +64,69 @@ SQLITE_REGISTRATION_KEYS = [
     "kirocli:odic:device-registration",
     "codewhisperer:odic:device-registration",
 ]
+
+KIRO_PROFILE_ARN_PATTERN = re.compile(
+    r"^arn:(?:aws|aws-cn|aws-us-gov):codewhisperer:"
+    r"[a-z]{2}(?:-gov)?-[a-z]+-\d:\d{12}:profile/"
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+)
+KIRO_PROFILE_RELATIVE_PATH = (
+    Path("User") / "globalStorage" / "kiro.kiroagent" / "profile.json"
+)
+
+
+def _strip_nonempty_string(value: object) -> Optional[str]:
+    """Return a stripped non-empty string when available."""
+    if not isinstance(value, str):
+        return None
+
+    return value.strip() or None
+
+
+def _normalize_profile_arn(value: object) -> Optional[str]:
+    """Return a validated CodeWhisperer profile ARN.
+
+    Args:
+        value: Candidate value loaded from local credentials or an API response.
+
+    Returns:
+        A stripped profile ARN, or None when the value is invalid.
+    """
+    profile_arn = _strip_nonempty_string(value)
+    if not profile_arn or not KIRO_PROFILE_ARN_PATTERN.fullmatch(profile_arn):
+        return None
+
+    return profile_arn
+
+
+def _get_kiro_profile_paths() -> list[Path]:
+    """Return Kiro IDE profile paths for supported desktop platforms.
+
+    Returns:
+        Candidate profile paths ordered by the active platform environment.
+    """
+    home = Path.home()
+    app_data = Path(os.getenv("APPDATA") or home / "AppData" / "Roaming")
+    xdg_config = Path(os.getenv("XDG_CONFIG_HOME") or home / ".config")
+    roots = {
+        "darwin": [home / "Library" / "Application Support" / "Kiro"],
+        "win32": [app_data / "Kiro"],
+    }.get(sys.platform, [xdg_config / "Kiro"])
+
+    return [root / KIRO_PROFILE_RELATIVE_PATH for root in roots]
+
+
+def _is_default_kiro_token_path(path: Path) -> bool:
+    """Check whether path is Kiro IDE's default token cache.
+
+    Args:
+        path: Credentials path being loaded.
+
+    Returns:
+        True when path resolves to Kiro IDE's default token cache.
+    """
+    default_path = Path.home() / ".aws" / "sso" / "cache" / "kiro-auth-token.json"
+    return path.resolve() == default_path.resolve()
 
 
 class AuthType(Enum):
@@ -418,8 +482,15 @@ class KiroAuthManager:
                 self._refresh_token = data['refreshToken']
             if 'accessToken' in data:
                 self._access_token = data['accessToken']
-            if 'profileArn' in data:
-                self._profile_arn = data['profileArn']
+            configured_profile_arn = _strip_nonempty_string(self._profile_arn)
+            file_profile_arn = data.get("profileArn")
+            malformed_file_profile_arn = (
+                "profileArn" in data
+                and file_profile_arn is not None
+                and not isinstance(file_profile_arn, str)
+            )
+            if not configured_profile_arn:
+                self._profile_arn = _strip_nonempty_string(file_profile_arn)
             if 'region' in data:
                 # Store as SSO region for OIDC token refresh
                 self._sso_region = data['region']
@@ -428,9 +499,12 @@ class KiroAuthManager:
                 logger.debug(f"Region from JSON credentials: {data['region']}")
             
             # Load clientIdHash and device registration for Enterprise Kiro IDE
-            if 'clientIdHash' in data:
-                self._client_id_hash = data['clientIdHash']
-                self._load_enterprise_device_registration(self._client_id_hash)
+            client_id_hash = _strip_nonempty_string(data.get("clientIdHash"))
+            if client_id_hash:
+                self._client_id_hash = client_id_hash
+                self._load_enterprise_device_registration(client_id_hash)
+                if not malformed_file_profile_arn:
+                    self._load_kiro_profile_arn(path)
             
             # Load AWS SSO OIDC specific fields (if directly in credentials file)
             if 'clientId' in data:
@@ -454,6 +528,51 @@ class KiroAuthManager:
             
         except Exception as e:
             logger.error(f"Error loading credentials from file: {e}")
+
+    def _load_kiro_profile_arn(self, credentials_path: Path) -> None:
+        """Load profile ARN from Kiro IDE state for its default token cache.
+
+        Args:
+            credentials_path: Path of the JSON credentials currently being loaded.
+        """
+        if _strip_nonempty_string(self._profile_arn):
+            return
+
+        try:
+            if not _is_default_kiro_token_path(credentials_path):
+                return
+            profile_paths = _get_kiro_profile_paths()
+        except (OSError, RuntimeError) as error:
+            logger.warning(f"Failed to locate Kiro IDE profile: {error}")
+            return
+
+        for profile_path in profile_paths:
+            try:
+                if not profile_path.is_file():
+                    continue
+                with open(profile_path, "r", encoding="utf-8") as profile_file:
+                    profile_data = json.load(profile_file)
+            except (
+                OSError,
+                RuntimeError,
+                UnicodeError,
+                json.JSONDecodeError,
+            ) as error:
+                logger.warning(f"Failed to load Kiro IDE profile from {profile_path}: {error}")
+                continue
+
+            if not isinstance(profile_data, dict):
+                logger.warning(f"Ignoring malformed Kiro IDE profile: {profile_path}")
+                continue
+
+            profile_arn = _normalize_profile_arn(profile_data.get("arn"))
+            if not profile_arn:
+                logger.warning(f"Ignoring invalid Kiro IDE profile ARN: {profile_path}")
+                continue
+
+            self._profile_arn = profile_arn
+            logger.info(f"Kiro IDE profile ARN loaded from {profile_path}")
+            return
     
     def _load_enterprise_device_registration(self, client_id_hash: str) -> None:
         """
@@ -509,8 +628,9 @@ class KiroAuthManager:
             existing_data['refreshToken'] = self._refresh_token
             if self._expires_at:
                 existing_data['expiresAt'] = self._expires_at.isoformat()
-            if self._profile_arn:
-                existing_data['profileArn'] = self._profile_arn
+            profile_arn = _strip_nonempty_string(self._profile_arn)
+            if profile_arn:
+                existing_data['profileArn'] = profile_arn
             
             # Save
             with open(path, 'w', encoding='utf-8') as f:
@@ -616,6 +736,9 @@ class KiroAuthManager:
             # Update scopes if we have them
             if self._scopes:
                 existing_data["scopes"] = self._scopes
+            profile_arn = _strip_nonempty_string(self._profile_arn)
+            if profile_arn:
+                existing_data["profile_arn"] = profile_arn
             
             token_json = json.dumps(existing_data)
             
@@ -846,6 +969,7 @@ class KiroAuthManager:
         # AWS SSO OIDC CreateToken API returns camelCase fields
         new_access_token = result.get("accessToken")
         new_refresh_token = result.get("refreshToken")
+        new_profile_arn = _normalize_profile_arn(result.get("profileArn"))
         expires_in = result.get("expiresIn", 3600)
         
         if not new_access_token:
@@ -855,6 +979,8 @@ class KiroAuthManager:
         self._access_token = new_access_token
         if new_refresh_token:
             self._refresh_token = new_refresh_token
+        if new_profile_arn:
+            self._profile_arn = new_profile_arn
         
         # Calculate expiration time with buffer (minus 60 seconds)
         self._expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)

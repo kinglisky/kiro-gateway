@@ -173,8 +173,9 @@ KIRO_CREDS_FILE="~/.aws/sso/cache/your-sso-cache-file.json"
 # Password to protect YOUR proxy server
 PROXY_API_KEY="my-super-secret-password-123"
 
-# Note: PROFILE_ARN is NOT needed for AWS SSO (Builder ID and corporate accounts)
-# The gateway will work without it
+# Usually auto-detected for Kiro IDE's default Enterprise token cache.
+# Set it explicitly for copied or custom credential files.
+# PROFILE_ARN="arn:aws:codewhisperer:us-east-1:123456789012:profile/..."
 ```
 
 <details>
@@ -193,7 +194,7 @@ AWS SSO credentials files (from `~/.aws/sso/cache/`) contain:
 }
 ```
 
-**Note:** AWS SSO (Builder ID and corporate accounts) users do NOT need `profileArn`. The gateway will work without it (if specified, it will be ignored).
+**Note:** Kiro Runtime requires `profileArn`. For Kiro IDE's default Enterprise token cache (`~/.aws/sso/cache/kiro-auth-token.json`), the gateway loads it from the local Kiro IDE profile or a successful token refresh. When using a copied or custom credential file, set `PROFILE_ARN` explicitly to avoid associating credentials with the wrong IDE profile.
 
 </details>
 
@@ -208,7 +209,7 @@ The gateway automatically detects the authentication type based on the credentia
 - **AWS SSO (OIDC)**: Used when `clientId` and `clientSecret` ARE present
   - Endpoint: `https://oidc.{region}.amazonaws.com/token`
 
-No additional configuration is needed — just point to your credentials file!
+For Kiro IDE's default Enterprise token cache, no additional profile configuration is usually needed. Copied or custom credential files must also provide `PROFILE_ARN`.
 
 </details>
 

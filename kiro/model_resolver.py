@@ -133,6 +133,9 @@ def normalize_model_name(name: str) -> str:
 
     # Lowercase for consistent matching
     name_lower = name.lower()
+
+    if name_lower in VALID_RUNTIME_MODEL_IDS:
+        return name_lower
     
     # Pattern 1: Standard format - claude-{family}-{major}-{minor}(-{suffix})?
     # Matches: claude-haiku-4-5, claude-haiku-4-5-20251001, claude-haiku-4-5-latest

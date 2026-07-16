@@ -583,7 +583,28 @@ class TestFallbackModelsConfig:
         print("Verification: Contains at least one Claude model...")
         has_claude = any("claude" in mid.lower() for mid in model_ids)
         assert has_claude, "No Claude models in fallback list"
-    
+
+    def test_fallback_models_contain_exact_native_models(self):
+        from kiro.config import FALLBACK_MODELS
+
+        expected = {
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "deepseek-3.2",
+            "minimax-m2.5",
+            "minimax-m2.1",
+            "glm-5",
+            "qwen3-coder-next",
+        }
+        actual = {
+            model["modelId"]
+            for model in FALLBACK_MODELS
+            if model["modelId"] != "auto" and not model["modelId"].startswith("claude-")
+        }
+
+        assert actual == expected
+
     def test_fallback_models_use_dot_format(self):
         """
         What it does: Verifies that model IDs use dot format (e.g., claude-4.5).

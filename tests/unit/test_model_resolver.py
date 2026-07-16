@@ -395,6 +395,9 @@ class TestNormalizeModelName:
         
         print(f"Comparing result: Expected 'gpt-4', Got '{result}'")
         assert result == "gpt-4"
+
+    def test_preserves_unknown_model_case(self):
+        assert normalize_model_name("Unknown-Model") == "Unknown-Model"
     
     def test_handles_random_model_name(self):
         """
@@ -414,6 +417,19 @@ class TestNormalizeModelName:
 
 class TestNormalizeModelNameParametrized:
     """Parametrized tests for complete coverage of scenarios."""
+
+    @pytest.mark.parametrize("model_id", [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "deepseek-3.2",
+        "minimax-m2.5",
+        "minimax-m2.1",
+        "glm-5",
+        "qwen3-coder-next",
+    ])
+    def test_normalizes_native_model_ids_case_insensitively(self, model_id):
+        assert normalize_model_name(model_id.upper()) == model_id
     
     @pytest.mark.parametrize("input_model,expected", [
         # Standard format with minor version
